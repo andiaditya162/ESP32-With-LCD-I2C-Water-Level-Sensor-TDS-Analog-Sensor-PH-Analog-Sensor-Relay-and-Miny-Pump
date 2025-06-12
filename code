@@ -1,0 +1,187 @@
+// Library yang Digunakan
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h>
+#include <time.h>
+#include <LiquidCrystal_I2C.h>
+
+// Konfigurasi WiFi
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
+// Konfigurasi Firebase
+#define API_KEY ""
+#define FIREBASE_PROJECT_ID ""
+#define USER_EMAIL ""
+#define USER_PASSWORD ""
+
+// Pin Sensor
+#define sensorWaterLevel 32
+// #define sensorPH 34
+#define sensorTDS 33
+#define relay 4
+
+#define VREF 3.3
+#define SCOUNT 30
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// TDS Buffer
+int analogBuffer[SCOUNT];
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0;
+float averageVoltage = 0;
+float temperature = 27.0;
+float currentTDSValue = 0;
+
+unsigned long dataMillis = 0;
+unsigned long tdsSampleMillis = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(sensorWaterLevel, INPUT);
+  pinMode(sensorTDS, INPUT);
+  pinMode(relay, OUTPUT);
+
+  lcd.init();
+  lcd.backlight();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    lcd.setCursor(0, 0);
+    lcd.print(".");
+    Serial.print(".");
+  }
+
+  lcd.clear();
+  Serial.println();
+  lcd.setCursor(0, 0); lcd.print("WiFi Connected!");
+  lcd.setCursor(0, 1); lcd.print(WiFi.localIP());
+
+  config.api_key = API_KEY;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectNetwork(true);
+  fbdo.setBSSLBufferSize(4096, 1024);
+  fbdo.setResponseSize(2048);
+  Firebase.begin(&config, &auth);
+  lcd.clear();
+
+  lcd.setCursor(0, 0); lcd.print("Air:");
+  lcd.setCursor(7, 0); lcd.print("cm");
+  lcd.setCursor(0, 1); lcd.print("TDS:");
+  lcd.setCursor(10, 1); lcd.print("ppm");
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo)) {
+    Serial.println("Waiting for time sync...");
+    delay(1000);
+  }
+}
+
+int readWaterLevel() {
+  int sensorWaterValue = analogRead(sensorWaterLevel);
+  return map(sensorWaterValue, 0, 2750, 0, 5); // max 5 cm
+}
+
+float readTDS() {
+  float v = averageVoltage;
+  float currentTDSValue = 0.5 * v * (v * (133.42 * v - 255.86) + 857.39);
+  return currentTDSValue;
+}
+// Fungsi Median Filter untuk TDS
+int getMedianNum(int bArray[], int iFilterLen) {
+  int bTab[iFilterLen];
+  for (byte i = 0; i < iFilterLen; i++) bTab[i] = bArray[i];
+
+  for (int j = 0; j < iFilterLen - 1; j++) {
+    for (int i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        int temp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = temp;
+      }
+    }
+  }
+
+  if (iFilterLen % 2 == 1)
+    return bTab[iFilterLen / 2];
+  else
+    return (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+}
+
+void loop() {
+  // Sampling TDS setiap 40ms
+  if (millis() - tdsSampleMillis > 40) {
+    tdsSampleMillis = millis();
+    analogBuffer[analogBufferIndex++] = analogRead(sensorTDS);
+    if (analogBufferIndex == SCOUNT) analogBufferIndex = 0;
+  }
+
+  // Proses dan tampilkan TDS setiap 800ms
+  static unsigned long tdsCalcMillis = 0;
+  if (millis() - tdsCalcMillis > 800) {
+    tdsCalcMillis = millis();
+
+    for (int i = 0; i < SCOUNT; i++) analogBufferTemp[i] = analogBuffer[i];
+
+    averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * VREF / 4095.0;
+    float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
+    float compensationVoltage = averageVoltage / compensationCoefficient;
+    averageVoltage = compensationVoltage;
+
+    currentTDSValue = readTDS();
+    lcd.setCursor(5, 1); lcd.print("    ");
+    lcd.setCursor(5, 1); lcd.print((int)currentTDSValue);
+  }
+
+  int currentWaterLevel = readWaterLevel();
+
+  bool pumpStatus = currentWaterLevel < 3;
+  digitalWrite(relay, pumpStatus ? LOW : HIGH);
+  
+  lcd.setCursor(5, 0); lcd.print(currentWaterLevel);
+  
+  Serial.print("Level Air: ");
+  Serial.print(currentWaterLevel);
+  Serial.println("cm");
+  Serial.print("Nilai TDS: ");
+  Serial.print(int(currentTDSValue));
+  Serial.print("ppm");
+  Serial.println("");
+
+  // Kirim ke Firebase setiap 60 detik
+  if (Firebase.ready() && (millis() - dataMillis > 60000 || dataMillis == 0)) {
+    dataMillis = millis();
+    struct tm timeinfo;
+    getLocalTime(&timeinfo);
+
+    String documentId = String(timeinfo.tm_year + 1900) + "-" +
+                        String(timeinfo.tm_mon + 1) + "-" +
+                        String(timeinfo.tm_mday) + "-" +
+                        String(timeinfo.tm_hour) + "-" +
+                        String(timeinfo.tm_min);
+
+    FirebaseJson content;
+    content.set("fields/waterLevel/integerValue", currentWaterLevel);
+    content.set("fields/pumpStatus/booleanValue", pumpStatus);
+    content.set("fields/tdsValue/integerValue", (int)currentTDSValue);
+
+    String fullDocumentPath = "pakcoy/" + documentId;
+
+    if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", fullDocumentPath.c_str(), content.raw())) {
+      Serial.println("Data stored to Firestore!");
+    } else {
+      Serial.print("Firestore write failed: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+}
