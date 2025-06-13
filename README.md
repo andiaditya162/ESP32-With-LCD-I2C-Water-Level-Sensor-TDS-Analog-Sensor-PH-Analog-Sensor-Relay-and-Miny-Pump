@@ -1,4 +1,4 @@
-# ESP32-With-LCD-I2C-Water-Level-Sensor-TDS-Analog-Sensor-PH-Analog-Sensor-Relay-and-Miny-Pump
+# Hidroponic-Monitoring-with-ESP32-LCD-I2C-Water-Level-Sensor-TDS-Analog-Sensor-PH-Analog-Sensor-Relay-and-Miny-Pump
 ## Componens Used
 * ESP32 ESP-32 DOIT WiFi Bluetooth IoT Development Board CH340 Type-C
 * I/O Expansion ESP32 Shield ESP32 DOIT V1 30P Base Plate Extension
